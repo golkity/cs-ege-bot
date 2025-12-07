@@ -8,9 +8,12 @@ use std::sync::Arc;
 use dotenvy::dotenv;
 use teloxide::prelude::*;
 use teloxide::dispatching::dialogue::InMemStorage;
+use teloxide::RequestError;
+use teloxide::ApiError;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use chrono::Utc;
 use sqlx::Row;
+use warp::Filter;
 
 use crate::db::{init_db, DbPool};
 use crate::states::{DialogueState, SubmissionType};
@@ -46,6 +49,13 @@ async fn main() -> anyhow::Result<()> {
         media_groups: Arc::new(dashmap::DashMap::new()),
     };
 
+    tokio::spawn(async move {
+        let port_str = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+        let port = port_str.parse::<u16>().unwrap_or(8080);
+        let routes = warp::any().map(|| "I'm alive! Bot is running.");
+        warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+    });
+
     let bot = Bot::new(token);
 
     let sched = JobScheduler::new().await?;
@@ -60,10 +70,16 @@ async fn main() -> anyhow::Result<()> {
             if let Ok(users) = rows {
                 for row in users {
                     let uid: i64 = row.get("id");
-                    let _ = bot.send_message(
+                    match bot.send_message(
                         UserId(uid as u64),
                         "⏰ Напоминание: не забудьте сегодня сдать ДЗ и/или конспект."
-                    ).await;
+                    ).await {
+                        Ok(_) => {},
+                        Err(RequestError::Api(ApiError::BotBlocked)) => {
+                            let _ = sqlx::query("DELETE FROM users WHERE id = ?").bind(uid).execute(&pool).await;
+                        },
+                        Err(_) => {}
+                    }
                 }
             }
         })
@@ -107,10 +123,16 @@ async fn main() -> anyhow::Result<()> {
                     let _ = sqlx::query("INSERT OR IGNORE INTO miss_reasons (user_id, date, reason) VALUES (?, ?, '')")
                         .bind(uid).bind(&date).execute(&pool).await;
 
-                    let _ = bot.send_message(
+                    match bot.send_message(
                         UserId(uid as u64),
                         format!("Сегодня ({}) ты ничего не сдал(а). Укажи причину пропуска (отправь текст).", date)
-                    ).await;
+                    ).await {
+                        Ok(_) => {},
+                        Err(RequestError::Api(ApiError::BotBlocked)) => {
+                            let _ = sqlx::query("DELETE FROM users WHERE id = ?").bind(uid).execute(&pool).await;
+                        },
+                        Err(_) => {}
+                    }
                 }
             }
         })
@@ -133,11 +155,13 @@ async fn main() -> anyhow::Result<()> {
 
                 for row in users {
                     let uid: i64 = row.get("id");
-
-                    if let Err(e) = bot.send_message(UserId(uid as u64), message_text).await {
-                        log::error!("Не удалось отправить пасхалку юзеру {}: {:?}", uid, e);
+                    match bot.send_message(UserId(uid as u64), message_text).await {
+                        Ok(_) => {},
+                        Err(RequestError::Api(ApiError::BotBlocked)) => {
+                            let _ = sqlx::query("DELETE FROM users WHERE id = ?").bind(uid).execute(&pool).await;
+                        },
+                        Err(_) => {}
                     }
-
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
@@ -175,12 +199,8 @@ async fn main() -> anyhow::Result<()> {
 
                     if res.is_ok() {
                         if matches!(kind, SubmissionType::Conspect) {
-                            for (i, fid) in file_ids.iter().enumerate() {
-                                if let Err(e) = reports::save_file_to_disk(&bot, fid, &state.conspects_dir, uid, &section, &topic_id).await {
-                                    log::error!("Ошибка сохранения файла из альбома (user: {}): {:?}", uid, e);
-                                } else {
-                                    log::info!("Файл {} из альбома сохранен для user {}", i, uid);
-                                }
+                            for fid in file_ids.iter() {
+                                let _ = reports::save_file_to_disk(&bot, fid, &state.conspects_dir, uid, &section, &topic_id).await;
                             }
                         }
 
