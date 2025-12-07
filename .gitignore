@@ -1,0 +1,7 @@
+/target
+.env
+*.db
+.idea
+.vscode
+conspects
+bot.db
